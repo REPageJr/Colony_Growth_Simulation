@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BeeSim v15g - Teaching Version (Swarm up to 25k)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@1.4.0"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { margin-bottom: 0.5em; }
+    .container { width: 50%; margin: auto; }
+    .controls { display: grid; gap: 10px; margin-bottom: 15px; }
+    .controls label { display: flex; justify-content: space-between; align-items: center; }
+    .summary { margin-top: 16px; font-weight: bold; }
+    canvas { margin-top: 16px; max-width: 100%; }
+    button { margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>BeeSim v15g (Population + Comb + Failure Markers, Swarm up to 25k)</h1>
+    <div class="controls">
+      <label>Swarm Size
+        <span>
+          <input type="range" id="swarmSize" min="2000" max="25000" value="16000" step="500" oninput="updateValues()">
+          <span id="swarmVal">16000</span>
+        </span>
+      </label>
+      <label>Life Expectancy (days)
+        <span>
+          <input type="range" id="lifeExp" min="15" max="60" value="45" step="1" oninput="updateValues()">
+          <span id="lifeVal">45</span>
+        </span>
+      </label>
+      <label>Queen Egg Rate (eggs/day)
+        <span>
+          <input type="range" id="eggRate" min="500" max="2000" value="1500" step="100" oninput="updateValues()">
+          <span id="eggVal">1500</span>
+        </span>
+      </label>
+      <label>Brood Survival (%)
+        <span>
+          <input type="range" id="broodSurvival" min="50" max="100" value="80" step="1" oninput="updateValues()">
+          <span id="broodVal">80</span>%
+        </span>
+      </label>
+      <label>Swarm Month
+        <select id="swarmMonth" onchange="updateValues()">
+          <option value="5">May</option>
+          <option value="6" selected>June</option>
+          <option value="7">July</option>
+          <option value="8">August</option>
+        </select>
+      </label>
+      <button onclick="addSimulation()">Add Simulation</button>
+      <button onclick="clearSimulation()">Clear All</button>
+    </div>
+
+    <canvas id="simChart"></canvas>
+    <canvas id="combChart"></canvas>
+    <div class="summary" id="summary"></div>
+  </div>
+
+  <script>
+    let chart, combChart;
+    let simCount = 0;
+
+    const broodDev = 21;       // brood development (days)
+    const minViable = 7000;
+    const overwinterMin = 20000;
+
+    const startDate = new Date(2025, 4, 1); // May 1, 2025
+    const endDate = new Date(2025, 10, 1);  // Nov 1, 2025
+    const totalDays = Math.floor((endDate - startDate) / (1000*60*60*24));
+
+    // Comb logistic parameters
+    const maxComb = 100000;
+    const combRate = 0.25;   // logistic growth rate
+    const combMidpoint = 30; // day at which comb = 50% of max
+
+    // Failure marker interval
+    const markerEvery = 7;
+
+    // Logistic dash patterns
+    const dashPatterns = [[6,4],[2,6],[10,4],[1,4],[8,6,2,6]];
+
+    function earlyRamp(day) {
+      if (day <= 0) return 0.25;
+      if (day < 14) return 0.25 + 0.75 * (day/14);
+      return 1.0;
+    }
+
+    function daysToNov1(month) {
+      let swarmStart = new Date(2025, month-1, 1);
+      return Math.floor((endDate - swarmStart) / (1000*60*60*24));
+    }
+
+    function offsetFromMay1(month) {
+      let swarmStart = new Date(2025, month-1, 1);
+      return Math.floor((swarmStart - startDate) / (1000*60*60*24));
+    }
+
+    function updateValues() {
+      document.getElementById("swarmVal").textContent = document.getElementById("swarmSize").value;
+      document.getElementById("lifeVal").textContent = document.getElementById("lifeExp").value;
+      document.getElementById("eggVal").textContent = document.getElementById("eggRate").value;
+      document.getElementById("broodVal").textContent = document.getElementById("broodSurvival").value;
+    }
+
+    function simulate(swarmSize, lifeExp, eggRate, broodSurvival, swarmMonth) {
+      broodSurvival = broodSurvival / 100.0;
+      const horizonDays = daysToNov1(swarmMonth);
+      let adults = swarmSize;
+      let broodQueue = new Array(broodDev).fill(0);
+      let series = [adults];
+      let broodDemandSeries = [0];
+      let combSeries = [0];
+
+      for (let day = 1; day <= horizonDays; day++) {
+        // Comb logistic build
+        let combBuilt = maxComb / (1 + Math.exp(-combRate * (day - combMidpoint)));
+
+        // Empty comb = comb built - brood currently occupying
+        let broodOccupancy = broodQueue.reduce((a,b) => a+b, 0);
+        let emptyComb = Math.max(0, combBuilt - broodOccupancy);
+
+        // Egg laying limited by queen capacity and comb availability
+        let eggsCap = eggRate * earlyRamp(day);
+        let eggsToday = Math.min(eggsCap, emptyComb);
+
+        // Mortality
+        let dailyDeathProb = 1.0 - Math.exp(-1.0 / lifeExp);
+        let deaths = adults * dailyDeathProb;
+
+        // Emergence
+        let emerging = broodQueue[broodDev-1] * broodSurvival;
+
+        // Shift pipeline and add today's eggs
+        for (let i = broodDev-1; i > 0; i--) broodQueue[i] = broodQueue[i-1];
+        broodQueue[0] = eggsToday;
+
+        // Update adults
+        adults = adults - deaths + emerging;
+        if (adults < 0) adults = 0;
+        series.push(adults);
+
+        // Update brood demand and comb
+        broodDemandSeries.push(broodQueue.reduce((a,b) => a+b, 0));
+        combSeries.push(combBuilt);
+      }
+
+      // Logistic comparator
+      let K = eggRate * broodSurvival * lifeExp;
+      let t0 = 60, r = 0.15;
+      let logistic = [];
+      for (let day = 0; day <= horizonDays; day++) {
+        logistic.push(K / (1 + Math.exp(-r * (day - t0))));
+      }
+
+      return { series, logistic, combSeries, broodDemandSeries, horizonDays, K };
+    }
+
+    function addSimulation() {
+      const swarmSize = parseInt(document.getElementById("swarmSize").value);
+      const lifeExp = parseInt(document.getElementById("lifeExp").value);
+      const eggRate = parseInt(document.getElementById("eggRate").value);
+      const broodSurvival = parseInt(document.getElementById("broodSurvival").value);
+      const swarmMonth = parseInt(document.getElementById("swarmMonth").value);
+
+      const sim = simulate(swarmSize, lifeExp, eggRate, broodSurvival, swarmMonth);
+      const offset = offsetFromMay1(swarmMonth);
+
+      const bioData = Array(totalDays+1).fill(null);
+      const logData = Array(totalDays+1).fill(null);
+      const combData = Array(totalDays+1).fill(null);
+      const broodDemandData = Array(totalDays+1).fill(null);
+      for (let i = 0; i <= sim.horizonDays; i++) {
+        bioData[offset+i] = sim.series[i];
+        logData[offset+i] = sim.logistic[i];
+        combData[offset+i] = sim.combSeries[i];
+        broodDemandData[offset+i] = sim.broodDemandSeries[i];
+      }
+
+      // Find first failure day
+      let failureIdx = -1;
+      for (let i = 0; i < sim.series.length; i++) {
+        if (sim.series[i] !== null && sim.series[i] < minViable) { failureIdx = i; break; }
+      }
+
+      const labels = [];
+      for (let i = 0; i <= totalDays; i++) {
+        let d = new Date(startDate.getTime() + i*24*60*60*1000);
+        labels.push(d.toLocaleDateString("en-US", {month:"short", day:"numeric"}));
+      }
+
+      simCount++;
+      const colors = ["orange","blue","green","purple","brown","teal"];
+      const color = colors[(simCount-1) % colors.length];
+      const dashPattern = dashPatterns[(simCount-1) % dashPatterns.length];
+
+      const datasets = chart ? chart.data.datasets : [];
+
+      if (failureIdx === -1) {
+        const solidData = Array(totalDays+1).fill(null);
+        for (let i = 0; i <= sim.horizonDays; i++) solidData[offset+i] = sim.series[i];
+        datasets.push(
+          { label: `Sim ${simCount} Swarm`, data: solidData, borderColor: color, fill: false, borderWidth: 2.0, pointRadius: 0 }
+        );
+      } else {
+        const solidData = Array(totalDays+1).fill(null);
+        const failData = Array(totalDays+1).fill(null);
+        const failPointRadius = Array(totalDays+1).fill(0);
+        const failPointStyle = Array(totalDays+1).fill('crossRot');
+        const failPointColor = Array(totalDays+1).fill('red');
+
+        for (let i = 0; i < failureIdx; i++) solidData[offset+i] = sim.series[i];
+        for (let i = failureIdx; i <= sim.horizonDays; i++) {
+          failData[offset+i] = sim.series[i];
+          if ((i - failureIdx) % markerEvery === 0) failPointRadius[offset+i] = 4;
+        }
+
+        datasets.push(
+          { label: `Sim ${simCount} Swarm`, data: solidData, borderColor: color, fill: false, borderWidth: 2.0, pointRadius: 0 },
+          { label: `Sim ${simCount} Swarm (Fail<7k)`, data: failData, borderColor: color, fill: false, borderWidth: 2.0,
+            borderDash: [6,4], pointStyle: failPointStyle, pointRadius: failPointRadius,
+            pointBackgroundColor: failPointColor, pointBorderColor: failPointColor }
+        );
+      }
+
+      datasets.push(
+        { label: `Sim ${simCount} Logistic (K=${sim.K.toFixed(0)})`, data: logData, borderColor: color, fill: false, borderWidth: 2.0, borderDash: dashPattern, pointRadius: 0 }
+      );
+
+      const combDatasets = combChart ? combChart.data.datasets : [];
+      combDatasets.push(
+        { label: `Sim ${simCount} Comb Built`, data: combData, borderColor: color, fill: false, borderWidth: 2.0, pointRadius: 0 },
+        { label: `Sim ${simCount} Brood Occupancy`, data: broodDemandData, borderColor: color, fill: false, borderWidth: 2.0, borderDash: [6,4], pointRadius: 0 }
+      );
+
+      if (chart) chart.destroy();
+      const ctx = document.getElementById("simChart").getContext("2d");
+      chart = new Chart(ctx, {
+        type: "line",
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: true,
+          aspectRatio: 1.5,
+          elements: { line: { borderWidth: 2.0 }, point: { radius: 0 } },
+          plugins: {
+            legend: { position: "top" },
+            annotation: {
+              annotations: {
+                nov1: { type: 'line', xMin: totalDays, xMax: totalDays, borderColor: 'black', borderDash: [6,6], borderWidth: 1,
+                        label:{content:"Nov 1", enabled:true, position:"start"} },
+                minViable: { type: 'line', yMin: minViable, yMax: minViable, borderColor: 'gray', borderDash: [6,6], borderWidth: 1,
+                        label:{content:"7,000 min viable", enabled:true, position:"end"} },
+                overwinter: { type: 'line', yMin: overwinterMin, yMax: overwinterMin, borderColor: 'black', borderDash: [6,6], borderWidth: 1,
+                        label:{content:"20,000 overwinter", enabled:true, position:"end"} }
+              }
+            }
+          },
+          scales: {
+            x: { title: { display: true, text: "Date" } },
+            y: { title: { display: true, text: "Adult bees" } }
+          }
+        }
+      });
+
+      if (combChart) combChart.destroy();
+      const ctx2 = document.getElementById("combChart").getContext("2d");
+      combChart = new Chart(ctx2, {
+        type: "line",
+        data: { labels, datasets: combDatasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: true,
+          aspectRatio: 1.5,
+          elements: { line: { borderWidth: 2.0 }, point: { radius: 0 } },
+          plugins: { legend: { position: "top" } },
+          scales: {
+            x: { title: { display: true, text: "Date" } },
+            y: { title: { display: true, text: "Comb cells / Brood demand" }, suggestedMax: maxComb }
+          }
+        }
+      });
+
+      const peak = Math.max(...sim.series), peakDay = sim.series.indexOf(peak);
+      const finalVal = sim.series[sim.series.length-1];
+      const status = (failureIdx === -1) ? "OK" : `FAILED @ day ${failureIdx}`;
+      const prevSummary = document.getElementById("summary").innerHTML;
+      document.getElementById("summary").innerHTML =
+        prevSummary + `<div>Sim ${simCount} — Peak=${peak.toFixed(0)} (Day ${peakDay}), Nov 1=${finalVal.toFixed(0)}, K=${sim.K.toFixed(0)} <b>${status}</b></div>`;
+    }
+
+    function clearSimulation() {
+      if (chart) chart.destroy();
+      if (combChart) combChart.destroy();
+      chart = null;
+      combChart = null;
+      simCount = 0;
+      document.getElementById("summary").innerHTML = "";
+    }
+
+    updateValues();
+  </script>
+</body>
+</html>
